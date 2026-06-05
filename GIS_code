@@ -1,0 +1,138 @@
+from arcgis.gis import GIS
+from arcgis.features import FeatureLayer
+import pandas as pd
+from datetime import datetime
+
+# ------------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------------
+
+PORTAL_URL = "https://yourportal.domain.com/portal"
+USERNAME = "your_username"
+PASSWORD = "your_password"
+
+# Hosted standalone table URL
+TABLE_URL = "https://services.arcgis.com/xxxxx/arcgis/rest/services/PortalInventory/FeatureServer/0"
+
+# ------------------------------------------------------------------
+# CONNECT TO PORTAL
+# ------------------------------------------------------------------
+
+gis = GIS(PORTAL_URL, USERNAME, PASSWORD)
+
+print(f"Connected to: {gis.properties.name}")
+
+# ------------------------------------------------------------------
+# GET ALL ITEMS
+# ------------------------------------------------------------------
+
+all_items = []
+start = 1
+batch_size = 100
+
+while True:
+    items = gis.content.advanced_search(
+        query="*",
+        max_items=batch_size,
+        start=start
+    )["results"]
+
+    if not items:
+        break
+
+    all_items.extend(items)
+    start += batch_size
+
+print(f"Found {len(all_items)} items")
+
+# ------------------------------------------------------------------
+# EXTRACT ITEM INFORMATION
+# ------------------------------------------------------------------
+
+records = []
+
+for item in all_items:
+
+    # Sharing level
+    access_lookup = {
+        "private": "Private",
+        "org": "Organization",
+        "public": "Public",
+        "shared": "Group"
+    }
+
+    sharing = access_lookup.get(item.access, item.access)
+
+    records.append({
+        "title": item.title,
+        "itemid": item.id,
+        "item_type": item.type,
+        "owner": item.owner,
+        "created_date": datetime.fromtimestamp(item.created/1000),
+        "modified_date": datetime.fromtimestamp(item.modified/1000),
+        "view_count": item.numViews,
+        "sharing_level": sharing,
+        "tags": ",".join(item.tags) if item.tags else "",
+        "snippet": item.snippet if item.snippet else "",
+        "url": item.url if item.url else "",
+        "size_bytes": item.size,
+    })
+
+df = pd.DataFrame(records)
+
+print(df.head())
+
+# ------------------------------------------------------------------
+# CONNECT TO HOSTED TABLE
+# ------------------------------------------------------------------
+
+table = FeatureLayer(TABLE_URL)
+
+# ------------------------------------------------------------------
+# TRUNCATE TABLE
+# ------------------------------------------------------------------
+
+print("Truncating table...")
+
+table.manager.truncate()
+
+# ------------------------------------------------------------------
+# APPEND RECORDS
+# ------------------------------------------------------------------
+
+features = []
+
+for _, row in df.iterrows():
+
+    attrs = {
+        "title": row["title"],
+        "itemid": row["itemid"],
+        "item_type": row["item_type"],
+        "owner": row["owner"],
+        "created_date": row["created_date"],
+        "modified_date": row["modified_date"],
+        "view_count": row["view_count"],
+        "sharing_level": row["sharing_level"],
+        "tags": row["tags"],
+        "snippet": row["snippet"],
+        "url": row["url"],
+        "size_bytes": row["size_bytes"]
+    }
+
+    features.append({"attributes": attrs})
+
+# Append in chunks
+chunk_size = 500
+
+for i in range(0, len(features), chunk_size):
+
+    batch = features[i:i+chunk_size]
+
+    result = table.edit_features(adds=batch)
+
+    print(
+        f"Added {len(batch)} records "
+        f"({i + len(batch)} of {len(features)})"
+    )
+
+print("Inventory refresh complete.")
