@@ -1,74 +1,57 @@
 from arcgis.gis import GIS
 from arcgis.features import FeatureLayer
 import pandas as pd
-from datetime import datetime
+import tempfile
+import os
 import logging
 
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
 # CONFIGURATION
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
 
 PORTAL_URL = "https://yourportal.domain.com/portal"
 USERNAME = "username"
 PASSWORD = "password"
 
-TABLE_URL = "https://services.arcgis.com/xxxxx/arcgis/rest/services/PortalInventory/FeatureServer/0"
+HOSTED_TABLE_ITEMID = "xxxxxxxxxxxxxxxxxxxx"
 
-BATCH_SIZE = 100
-
-# ---------------------------------------------------------------------
-# LOGGING
-# ---------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
 # CONNECT
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
 
 gis = GIS(PORTAL_URL, USERNAME, PASSWORD)
 
-logging.info(f"Connected to {gis.properties.name}")
+table_item = gis.content.get(HOSTED_TABLE_ITEMID)
 
-# ---------------------------------------------------------------------
-# GET TOTAL ITEM COUNT
-# ---------------------------------------------------------------------
+# Standalone table layer
+table = table_item.tables[0]
 
-count_result = gis.content.advanced_search(
+logging.info("Connected")
+
+# ------------------------------------------------------------------
+# GET ALL ITEMS
+# ------------------------------------------------------------------
+
+total_items = gis.content.advanced_search(
     query="*",
     return_count=True
 )
 
-total_items = count_result
-
-logging.info(f"Total items found: {total_items}")
-
-# ---------------------------------------------------------------------
-# DOWNLOAD ITEMS
-# ---------------------------------------------------------------------
-
 all_items = []
 
-for start in range(1, total_items + 1, BATCH_SIZE):
-
-    logging.info(f"Processing batch starting at {start}")
+for start in range(1, total_items + 1, 100):
 
     results = gis.content.advanced_search(
         query="*",
-        max_items=BATCH_SIZE,
+        max_items=100,
         start=start
     )
 
     all_items.extend(results["results"])
 
-logging.info(f"Retrieved {len(all_items)} items")
-
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
 # BUILD INVENTORY
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
 
 records = []
 
@@ -76,127 +59,152 @@ for item in all_items:
 
     try:
 
-        created_epoch = item.created
-        modified_epoch = item.modified
-
-        sharing_groups = []
+        groups = []
 
         try:
-            sharing = item.shared_with
-            groups = sharing.get("groups", [])
-            sharing_groups = [g.get("title") for g in groups]
+            shared = item.shared_with
+            groups = [
+                g["title"]
+                for g in shared.get("groups", [])
+            ]
         except:
             pass
 
-        owner_folder = ""
+        records.append({
 
-        try:
-            owner_folder = item.ownerFolder
-        except:
-            pass
-
-        record = {
-
-            # Core
             "itemid": item.id,
             "title": item.title,
             "item_type": item.type,
             "owner": item.owner,
 
-            # Dates
-            "created_date": created_epoch,
-            "modified_date": modified_epoch,
+            "created_date": item.created,
+            "modified_date": item.modified,
 
-            # Usage
             "view_count": getattr(item, "numViews", 0),
-            "num_comments": getattr(item, "numComments", 0),
 
-            # Sharing
             "access": item.access,
-            "sharing_groups": ", ".join(sharing_groups),
 
-            # Organization
-            "owner_folder": owner_folder,
+            "sharing_groups": ", ".join(groups),
 
-            # Metadata
-            "tags": ", ".join(item.tags) if item.tags else "",
-            "categories": ", ".join(item.categories) if item.categories else "",
-            "type_keywords": ", ".join(item.typeKeywords) if item.typeKeywords else "",
+            "owner_folder": getattr(
+                item,
+                "ownerFolder",
+                ""
+            ),
 
-            # Status
-            "content_status": getattr(item, "content_status", ""),
-            "protected": getattr(item, "protected", False),
+            "tags": ", ".join(item.tags)
+            if item.tags else "",
 
-            # Description
-            "snippet": item.snippet if item.snippet else "",
-            "description": item.description if item.description else "",
+            "categories": ", ".join(item.categories)
+            if item.categories else "",
 
-            # Misc
-            "homepage": getattr(item, "homepage", ""),
-            "url": item.url if item.url else "",
-            "size_bytes": item.size if item.size else 0
+            "type_keywords": ", ".join(item.typeKeywords)
+            if item.typeKeywords else "",
 
-        }
+            "content_status": getattr(
+                item,
+                "content_status",
+                ""
+            ),
 
-        records.append(record)
+            "protected": str(
+                getattr(item, "protected", False)
+            ),
+
+            "snippet": item.snippet or "",
+
+            "description": item.description or "",
+
+            "url": item.url or "",
+
+            "size_bytes": item.size or 0
+
+        })
 
     except Exception as ex:
 
-        logging.error(
-            f"Failed processing item {item.id}: {str(ex)}"
+        logging.warning(
+            f"Failed item {item.id}: {str(ex)}"
         )
 
-logging.info(f"Inventory records created: {len(records)}")
-
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
 # DATAFRAME
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
 
 df = pd.DataFrame(records)
 
-logging.info(f"Rows in dataframe: {len(df)}")
+logging.info(
+    f"Created dataframe with {len(df)} rows"
+)
 
-# ---------------------------------------------------------------------
-# HOSTED TABLE
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
+# WRITE TEMP CSV
+# ------------------------------------------------------------------
 
-table = FeatureLayer(TABLE_URL)
+temp_dir = tempfile.gettempdir()
 
-# ---------------------------------------------------------------------
-# TRUNCATE
-# ---------------------------------------------------------------------
+csv_path = os.path.join(
+    temp_dir,
+    "portal_inventory.csv"
+)
 
-logging.info("Truncating hosted table")
+df.to_csv(
+    csv_path,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+logging.info(csv_path)
+
+# ------------------------------------------------------------------
+# UPLOAD CSV
+# ------------------------------------------------------------------
+
+csv_item = gis.content.add(
+    {
+        "title": "Portal Inventory Temp",
+        "type": "CSV"
+    },
+    data=csv_path
+)
+
+logging.info(
+    f"CSV uploaded: {csv_item.id}"
+)
+
+# ------------------------------------------------------------------
+# TRUNCATE TABLE
+# ------------------------------------------------------------------
 
 table.manager.truncate()
 
-# ---------------------------------------------------------------------
-# APPEND
-# ---------------------------------------------------------------------
+logging.info("Table truncated")
 
-features = []
+# ------------------------------------------------------------------
+# APPEND CSV TO TABLE
+# ------------------------------------------------------------------
 
-for _, row in df.iterrows():
+append_result = table.append(
+    item_id=csv_item.id,
+    upload_format="csv",
+    source_table_name=None,
+    field_mappings=[]
+)
 
-    features.append({
-        "attributes": row.to_dict()
-    })
+logging.info(
+    f"Append Result: {append_result}"
+)
 
-chunk_size = 500
+# ------------------------------------------------------------------
+# CLEANUP
+# ------------------------------------------------------------------
 
-for i in range(0, len(features), chunk_size):
+csv_item.delete()
 
-    batch = features[i:i + chunk_size]
+logging.info(
+    "Temporary CSV deleted"
+)
 
-    result = table.edit_features(adds=batch)
-
-    success_count = sum(
-        1 for r in result["addResults"]
-        if r.get("success")
-    )
-
-    logging.info(
-        f"Added {success_count} of {len(batch)} records"
-    )
-
-logging.info("Portal inventory refresh complete")
+logging.info(
+    "Portal Inventory Refresh Complete"
+)
