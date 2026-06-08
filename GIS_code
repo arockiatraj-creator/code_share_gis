@@ -1,210 +1,243 @@
 from arcgis.gis import GIS
 from arcgis.features import FeatureLayer
-import pandas as pd
-import tempfile
-import os
+from datetime import datetime
 import logging
+import math
 
-# ------------------------------------------------------------------
-# CONFIGURATION
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------
 
-PORTAL_URL = "https://yourportal.domain.com/portal"
-USERNAME = "username"
+PORTAL_URL = "https://portal.company.com/portal"
+USERNAME = "portaladmin"
 PASSWORD = "password"
 
-HOSTED_TABLE_ITEMID = "xxxxxxxxxxxxxxxxxxxx"
+TABLE_URL = r"https://server.company.com/server/rest/services/Hosted/PortalInventory/FeatureServer/0"
 
-# ------------------------------------------------------------------
+SEARCH_BATCH_SIZE = 100
+INSERT_BATCH_SIZE = 500
+
+# -----------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+# -----------------------------------------------------------
 # CONNECT
-# ------------------------------------------------------------------
+# -----------------------------------------------------------
 
 gis = GIS(PORTAL_URL, USERNAME, PASSWORD)
 
-table_item = gis.content.get(HOSTED_TABLE_ITEMID)
+table = FeatureLayer(TABLE_URL, gis)
 
-# Standalone table layer
-table = table_item.tables[0]
+logging.info(f"Connected to {gis.properties.name}")
 
-logging.info("Connected")
+# -----------------------------------------------------------
+# TRUNCATE TABLE
+# -----------------------------------------------------------
 
-# ------------------------------------------------------------------
-# GET ALL ITEMS
-# ------------------------------------------------------------------
+logging.info("Truncating target table")
+
+table.manager.truncate()
+
+# -----------------------------------------------------------
+# GET TOTAL ITEM COUNT
+# -----------------------------------------------------------
 
 total_items = gis.content.advanced_search(
     query="*",
     return_count=True
 )
 
-all_items = []
+logging.info(f"Total Portal Items: {total_items}")
 
-for start in range(1, total_items + 1, 100):
+# -----------------------------------------------------------
+# HELPERS
+# -----------------------------------------------------------
 
-    results = gis.content.advanced_search(
-        query="*",
-        max_items=100,
-        start=start
-    )
+def get_sharing_groups(item):
 
-    all_items.extend(results["results"])
+    try:
+        groups = item.shared_with.get("groups", [])
+        return ", ".join(
+            [g["title"] for g in groups]
+        )
 
-# ------------------------------------------------------------------
-# BUILD INVENTORY
-# ------------------------------------------------------------------
+    except:
+        return ""
 
-records = []
 
-for item in all_items:
+def build_feature(item):
 
     try:
 
-        groups = []
+        return {
+            "attributes": {
 
-        try:
-            shared = item.shared_with
-            groups = [
-                g["title"]
-                for g in shared.get("groups", [])
-            ]
-        except:
-            pass
+                "itemid": item.id,
 
-        records.append({
+                "title": item.title[:500]
+                if item.title else "",
 
-            "itemid": item.id,
-            "title": item.title,
-            "item_type": item.type,
-            "owner": item.owner,
+                "item_type": item.type,
 
-            "created_date": item.created,
-            "modified_date": item.modified,
+                "owner": item.owner,
 
-            "view_count": getattr(item, "numViews", 0),
+                "created_date": item.created,
 
-            "access": item.access,
+                "modified_date": item.modified,
 
-            "sharing_groups": ", ".join(groups),
+                "view_count": getattr(
+                    item,
+                    "numViews",
+                    0
+                ),
 
-            "owner_folder": getattr(
-                item,
-                "ownerFolder",
-                ""
-            ),
+                "access": item.access,
 
-            "tags": ", ".join(item.tags)
-            if item.tags else "",
+                "sharing_groups":
+                    get_sharing_groups(item),
 
-            "categories": ", ".join(item.categories)
-            if item.categories else "",
+                "owner_folder":
+                    str(
+                        getattr(
+                            item,
+                            "ownerFolder",
+                            ""
+                        )
+                    ),
 
-            "type_keywords": ", ".join(item.typeKeywords)
-            if item.typeKeywords else "",
+                "tags":
+                    ", ".join(item.tags)
+                    if item.tags else "",
 
-            "content_status": getattr(
-                item,
-                "content_status",
-                ""
-            ),
+                "categories":
+                    ", ".join(item.categories)
+                    if item.categories else "",
 
-            "protected": str(
-                getattr(item, "protected", False)
-            ),
+                "type_keywords":
+                    ", ".join(item.typeKeywords)
+                    if item.typeKeywords else "",
 
-            "snippet": item.snippet or "",
+                "content_status":
+                    str(
+                        getattr(
+                            item,
+                            "content_status",
+                            ""
+                        )
+                    ),
 
-            "description": item.description or "",
+                "protected":
+                    str(
+                        getattr(
+                            item,
+                            "protected",
+                            False
+                        )
+                    ),
 
-            "url": item.url or "",
+                "snippet":
+                    item.snippet[:4000]
+                    if item.snippet else "",
 
-            "size_bytes": item.size or 0
+                "description":
+                    item.description[:4000]
+                    if item.description else "",
 
-        })
+                "url":
+                    item.url
+                    if item.url else "",
+
+                "size_bytes":
+                    item.size
+                    if item.size else 0
+            }
+        }
 
     except Exception as ex:
 
-        logging.warning(
-            f"Failed item {item.id}: {str(ex)}"
+        logging.error(
+            f"Failed item {item.id}: {ex}"
         )
 
-# ------------------------------------------------------------------
-# DATAFRAME
-# ------------------------------------------------------------------
+        return None
 
-df = pd.DataFrame(records)
 
-logging.info(
-    f"Created dataframe with {len(df)} rows"
-)
+# -----------------------------------------------------------
+# LOAD ITEMS IN STREAMING MODE
+# -----------------------------------------------------------
 
-# ------------------------------------------------------------------
-# WRITE TEMP CSV
-# ------------------------------------------------------------------
+insert_buffer = []
 
-temp_dir = tempfile.gettempdir()
+inserted = 0
 
-csv_path = os.path.join(
-    temp_dir,
-    "portal_inventory.csv"
-)
+for start in range(
+        1,
+        total_items + 1,
+        SEARCH_BATCH_SIZE):
 
-df.to_csv(
-    csv_path,
-    index=False,
-    encoding="utf-8-sig"
-)
+    logging.info(
+        f"Reading items starting at {start}"
+    )
 
-logging.info(csv_path)
+    result = gis.content.advanced_search(
+        query="*",
+        max_items=SEARCH_BATCH_SIZE,
+        start=start
+    )
 
-# ------------------------------------------------------------------
-# UPLOAD CSV
-# ------------------------------------------------------------------
+    items = result["results"]
 
-csv_item = gis.content.add(
-    {
-        "title": "Portal Inventory Temp",
-        "type": "CSV"
-    },
-    data=csv_path
-)
+    for item in items:
 
-logging.info(
-    f"CSV uploaded: {csv_item.id}"
-)
+        feature = build_feature(item)
 
-# ------------------------------------------------------------------
-# TRUNCATE TABLE
-# ------------------------------------------------------------------
+        if feature:
+            insert_buffer.append(feature)
 
-table.manager.truncate()
+        if len(insert_buffer) >= INSERT_BATCH_SIZE:
 
-logging.info("Table truncated")
+            response = table.edit_features(
+                adds=insert_buffer
+            )
 
-# ------------------------------------------------------------------
-# APPEND CSV TO TABLE
-# ------------------------------------------------------------------
+            success = sum(
+                1
+                for r in response["addResults"]
+                if r.get("success")
+            )
 
-append_result = table.append(
-    item_id=csv_item.id,
-    upload_format="csv",
-    source_table_name=None,
-    field_mappings=[]
-)
+            inserted += success
 
-logging.info(
-    f"Append Result: {append_result}"
-)
+            logging.info(
+                f"Inserted {inserted}"
+            )
 
-# ------------------------------------------------------------------
-# CLEANUP
-# ------------------------------------------------------------------
+            insert_buffer = []
 
-csv_item.delete()
+# -----------------------------------------------------------
+# FINAL INSERT
+# -----------------------------------------------------------
 
-logging.info(
-    "Temporary CSV deleted"
-)
+if insert_buffer:
+
+    response = table.edit_features(
+        adds=insert_buffer
+    )
+
+    success = sum(
+        1
+        for r in response["addResults"]
+        if r.get("success")
+    )
+
+    inserted += success
 
 logging.info(
-    "Portal Inventory Refresh Complete"
+    f"Completed. Total inserted: {inserted}"
 )
